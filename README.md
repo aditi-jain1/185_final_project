@@ -200,6 +200,162 @@ step_000445/adapter \
 --wandb_project llm-rl-final-project \
 --wandb_name wildchat_min4_judged_5k_gspo_rm445_v1
 
+Part 2 Online Experiments
+1. Reward-Model Checkpoint Selection
+This compares candidate RM checkpoints on test_prefs, picks the best one, then runs the same GRPO recipe.
+
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_paths \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000350/adapter \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000400/adapter \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000445/adapter \
+--reward_model_select_best \
+--reward_selection_split test_prefs \
+--reward_selection_limit 256 \
+--output_dir /vol/runs/wildchat_min4_judged_5k_grpo_rm_select_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_grpo_rm_select_v1
+
+2. Reward-Model Ensemble With Pessimistic Aggregation
+This scores each rollout with multiple RM checkpoints and uses mean - coef * std as the reward.
+
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_paths \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000350/adapter \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000400/adapter \
+/vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000445/adapter \
+--reward_aggregation pessimistic \
+--reward_pessimism_coef 1.0 \
+--output_dir /vol/runs/wildchat_min4_judged_5k_grpo_rm_ensemble_pess_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_grpo_rm_ensemble_pess_v1
+
+3. Rank-Only Baseline / Advantages
+This ignores reward magnitudes inside each group and uses only completion rank.
+
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_path /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000445/adapter \
+--advantage_mode rank \
+--output_dir /vol/runs/wildchat_min4_judged_5k_grpo_rank_adv_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_grpo_rank_adv_v1
+
+4. Replay / Online Preference DPO
+This keeps recent best-vs-worst rollout pairs and adds an auxiliary online DPO loss.
+
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_path /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000445/adapter \
+--replay_enabled \
+--replay_capacity 128 \
+--replay_batch_size 8 \
+--replay_updates_per_step 1 \
+--replay_loss_weight 0.25 \
+--replay_algo dpo \
+--replay_beta 0.1 \
+--replay_min_reward_gap 0.0 \
+--output_dir /vol/runs/wildchat_min4_judged_5k_grpo_replay_dpo_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_grpo_replay_dpo_v1
 
 
 
