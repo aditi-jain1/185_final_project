@@ -5,19 +5,24 @@ import json
 import math
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from llm_rl_final_proj.data.ultrafeedback import GenerationExample, build_generation_examples, dataset_overview
+from llm_rl_final_proj.data.ultrafeedback import build_preference_examples
+from llm_rl_final_proj.models.logprobs import compute_per_token_logprobs
 from llm_rl_final_proj.models.load import (
     load_lora_policy_model_and_tokenizer,
     load_reward_model_and_tokenizer,
 )
 from llm_rl_final_proj.offline.evaluation import generate_samples, summarize_generation_rows
 from llm_rl_final_proj.reward_model.evaluation import score_prompt_response_pairs
+from llm_rl_final_proj.reward_model.evaluation import evaluate_reward_model_dataset
 from llm_rl_final_proj.rl.base import AlgoConfig
 from llm_rl_final_proj.rl.dr_grpo import DrGRPO
 from llm_rl_final_proj.rl.gspo import GSPO
@@ -42,6 +47,12 @@ class OnlineRMGRPOConfig:
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     reward_model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     reward_adapter_path: str = ""
+    reward_adapter_paths: List[str] | None = None
+    reward_model_select_best: bool = False
+    reward_selection_split: str = "test_prefs"
+    reward_selection_limit: int = 256
+    reward_aggregation: str = "single"
+    reward_pessimism_coef: float = 1.0
     dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized"
     train_split: str = "train_gen"
     eval_split: str = "test_gen"
@@ -73,6 +84,7 @@ class OnlineRMGRPOConfig:
     clip_eps_high: float = 0.0
     kl_coef: float = 0.02
     adv_clip: float = 5.0
+    advantage_mode: str = "reward"
 
     max_prompt_tokens: int = 700
     max_response_tokens: int = 256
@@ -100,6 +112,35 @@ class OnlineRMGRPOConfig:
     sample_log_n: int = 8
     sample_log_max_chars: int = 2500
 
+    replay_enabled: bool = False
+    replay_capacity: int = 128
+    replay_batch_size: int = 8
+    replay_updates_per_step: int = 1
+    replay_loss_weight: float = 1.0
+    replay_algo: str = "dpo"
+    replay_beta: float = 0.1
+    replay_min_reward_gap: float = 0.0
+
+
+@dataclass
+class RewardModelHandle:
+    adapter_path: str
+    model: torch.nn.Module
+    tokenizer: Any
+
+
+@dataclass
+class ReplayPreferenceExample:
+    chosen_input_ids: torch.Tensor
+    chosen_attention_mask: torch.Tensor
+    chosen_completion_mask: torch.Tensor
+    chosen_ref_logprobs: torch.Tensor
+    rejected_input_ids: torch.Tensor
+    rejected_attention_mask: torch.Tensor
+    rejected_completion_mask: torch.Tensor
+    rejected_ref_logprobs: torch.Tensor
+    reward_margin: float
+
 
 def parse_args() -> OnlineRMGRPOConfig:
     ap = argparse.ArgumentParser(description="Train a policy online with a GRPO-family algorithm using a learned reward model.")
@@ -111,7 +152,22 @@ def parse_args() -> OnlineRMGRPOConfig:
     )
     ap.add_argument("--model_name", type=str, default=OnlineRMGRPOConfig.model_name)
     ap.add_argument("--reward_model_name", type=str, default=OnlineRMGRPOConfig.reward_model_name)
-    ap.add_argument("--reward_adapter_path", type=str, required=True)
+    ap.add_argument("--reward_adapter_path", type=str, default=OnlineRMGRPOConfig.reward_adapter_path)
+    ap.add_argument("--reward_adapter_paths", type=str, nargs="+", default=None)
+    ap.add_argument(
+        "--reward_model_select_best",
+        action=argparse.BooleanOptionalAction,
+        default=OnlineRMGRPOConfig.reward_model_select_best,
+    )
+    ap.add_argument("--reward_selection_split", type=str, default=OnlineRMGRPOConfig.reward_selection_split)
+    ap.add_argument("--reward_selection_limit", type=int, default=OnlineRMGRPOConfig.reward_selection_limit)
+    ap.add_argument(
+        "--reward_aggregation",
+        type=str,
+        default=OnlineRMGRPOConfig.reward_aggregation,
+        choices=["single", "mean", "min", "pessimistic"],
+    )
+    ap.add_argument("--reward_pessimism_coef", type=float, default=OnlineRMGRPOConfig.reward_pessimism_coef)
     ap.add_argument("--dataset_name", type=str, default=OnlineRMGRPOConfig.dataset_name)
     ap.add_argument("--train_split", type=str, default=OnlineRMGRPOConfig.train_split)
     ap.add_argument("--eval_split", type=str, default=OnlineRMGRPOConfig.eval_split)
@@ -143,6 +199,12 @@ def parse_args() -> OnlineRMGRPOConfig:
     ap.add_argument("--clip_eps_high", type=float, default=OnlineRMGRPOConfig.clip_eps_high)
     ap.add_argument("--kl_coef", type=float, default=OnlineRMGRPOConfig.kl_coef)
     ap.add_argument("--adv_clip", type=float, default=OnlineRMGRPOConfig.adv_clip)
+    ap.add_argument(
+        "--advantage_mode",
+        type=str,
+        default=OnlineRMGRPOConfig.advantage_mode,
+        choices=["reward", "rank"],
+    )
 
     ap.add_argument("--max_prompt_tokens", type=int, default=OnlineRMGRPOConfig.max_prompt_tokens)
     ap.add_argument("--max_response_tokens", type=int, default=OnlineRMGRPOConfig.max_response_tokens)
@@ -177,6 +239,18 @@ def parse_args() -> OnlineRMGRPOConfig:
     )
     ap.add_argument("--sample_log_n", type=int, default=OnlineRMGRPOConfig.sample_log_n)
     ap.add_argument("--sample_log_max_chars", type=int, default=OnlineRMGRPOConfig.sample_log_max_chars)
+    ap.add_argument(
+        "--replay_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=OnlineRMGRPOConfig.replay_enabled,
+    )
+    ap.add_argument("--replay_capacity", type=int, default=OnlineRMGRPOConfig.replay_capacity)
+    ap.add_argument("--replay_batch_size", type=int, default=OnlineRMGRPOConfig.replay_batch_size)
+    ap.add_argument("--replay_updates_per_step", type=int, default=OnlineRMGRPOConfig.replay_updates_per_step)
+    ap.add_argument("--replay_loss_weight", type=float, default=OnlineRMGRPOConfig.replay_loss_weight)
+    ap.add_argument("--replay_algo", type=str, default=OnlineRMGRPOConfig.replay_algo, choices=["dpo", "ipo"])
+    ap.add_argument("--replay_beta", type=float, default=OnlineRMGRPOConfig.replay_beta)
+    ap.add_argument("--replay_min_reward_gap", type=float, default=OnlineRMGRPOConfig.replay_min_reward_gap)
     args = ap.parse_args()
     return OnlineRMGRPOConfig(**vars(args))
 
@@ -218,6 +292,271 @@ def _compute_group_advantages(
         std = rewards.std(dim=1, keepdim=True, unbiased=False)
         advantage = advantage / (std + eps)
     return advantage.view(-1)
+
+
+def _compute_rank_advantages(rewards: torch.Tensor, group_size: int, eps: float = 1e-6) -> torch.Tensor:
+    grouped = rewards.view(-1, group_size)
+    order = torch.argsort(grouped, dim=1)
+    ranks = torch.empty_like(grouped)
+    rank_values = torch.arange(group_size, device=rewards.device, dtype=rewards.dtype)
+    ranks.scatter_(1, order, rank_values.expand_as(grouped))
+    centered = ranks - ranks.mean(dim=1, keepdim=True)
+    scale = centered.std(dim=1, keepdim=True, unbiased=False)
+    return (centered / (scale + eps)).view(-1)
+
+
+def _compute_advantages(
+    rewards: torch.Tensor,
+    group_size: int,
+    *,
+    advantage_mode: str,
+    divide_by_std: bool,
+) -> torch.Tensor:
+    if advantage_mode == "rank":
+        return _compute_rank_advantages(rewards, group_size)
+    if advantage_mode == "reward":
+        return _compute_group_advantages(rewards, group_size, divide_by_std=divide_by_std)
+    raise ValueError(f"Unsupported advantage_mode={advantage_mode}")
+
+
+def _resolve_reward_adapter_paths(cfg: OnlineRMGRPOConfig) -> List[str]:
+    paths = list(cfg.reward_adapter_paths or [])
+    if cfg.reward_adapter_path:
+        paths.insert(0, cfg.reward_adapter_path)
+    paths = [str(p) for p in paths if str(p).strip()]
+    deduped = list(dict.fromkeys(paths))
+    if not deduped:
+        raise ValueError("Provide --reward_adapter_path or --reward_adapter_paths.")
+    if cfg.reward_aggregation != "single" and len(deduped) < 2:
+        raise ValueError(f"--reward_aggregation {cfg.reward_aggregation!r} requires at least two reward adapters.")
+    return deduped
+
+
+def _load_reward_handle(
+    *,
+    adapter_path: str,
+    cfg: OnlineRMGRPOConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> RewardModelHandle:
+    loaded = load_reward_model_and_tokenizer(
+        cfg.reward_model_name,
+        device=device,
+        dtype=dtype,
+        adapter_path=adapter_path,
+    )
+    loaded.model.eval()
+    for p in loaded.model.parameters():
+        p.requires_grad_(False)
+    return RewardModelHandle(adapter_path=adapter_path, model=loaded.model, tokenizer=loaded.tokenizer)
+
+
+def _select_reward_adapters(cfg: OnlineRMGRPOConfig, paths: Sequence[str], device: torch.device, dtype: torch.dtype) -> List[str]:
+    if not cfg.reward_model_select_best:
+        return list(paths)
+    examples = build_preference_examples(
+        cfg.dataset_name,
+        cfg.reward_selection_split,
+        limit=cfg.reward_selection_limit,
+    )
+    if not examples:
+        raise RuntimeError(f"Reward-model selection split {cfg.reward_selection_split!r} produced zero examples.")
+    scored: List[tuple[float, str]] = []
+    for path in paths:
+        handle = _load_reward_handle(adapter_path=path, cfg=cfg, device=device, dtype=dtype)
+        metrics = evaluate_reward_model_dataset(
+            handle.model,
+            handle.tokenizer,
+            examples,
+            max_prompt_tokens=cfg.max_prompt_tokens,
+            max_response_tokens=cfg.max_response_tokens,
+            per_device_eval_batch_size=cfg.reward_batch_size,
+            device=device,
+            desc=f"select[reward_model|{Path(path).parent.name}]",
+        )
+        acc = float(metrics["eval/rm_pair_accuracy"])
+        scored.append((acc, path))
+        print(f"[reward_model_selection] adapter={path} pair_accuracy={acc:.4f}")
+        del handle
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_acc, best_path = scored[0]
+    print(f"[reward_model_selection] selected={best_path} pair_accuracy={best_acc:.4f}")
+    return [best_path]
+
+
+@torch.no_grad()
+def _score_rows_with_reward_models(
+    handles: Sequence[RewardModelHandle],
+    rows: Sequence[Dict[str, object]],
+    *,
+    cfg: OnlineRMGRPOConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    per_model_scores: List[List[float]] = []
+    for handle in handles:
+        per_model_scores.append(
+            score_prompt_response_pairs(
+                handle.model,
+                handle.tokenizer,
+                rows,
+                max_prompt_tokens=cfg.max_prompt_tokens,
+                max_response_tokens=cfg.max_response_tokens,
+                per_device_batch_size=cfg.reward_batch_size,
+                device=device,
+            )
+        )
+    score_matrix = torch.tensor(per_model_scores, device=device, dtype=torch.float32)
+    if cfg.reward_aggregation == "single" or score_matrix.shape[0] == 1:
+        rewards = score_matrix[0]
+    elif cfg.reward_aggregation == "mean":
+        rewards = score_matrix.mean(dim=0)
+    elif cfg.reward_aggregation == "min":
+        rewards = score_matrix.min(dim=0).values
+    elif cfg.reward_aggregation == "pessimistic":
+        rewards = score_matrix.mean(dim=0) - cfg.reward_pessimism_coef * score_matrix.std(dim=0, unbiased=False)
+    else:
+        raise ValueError(f"Unsupported reward_aggregation={cfg.reward_aggregation}")
+    metrics = {
+        "reward_ensemble/model_count": float(score_matrix.shape[0]),
+        "reward_ensemble/aggregate_mean": float(rewards.mean().item()),
+        "reward_ensemble/aggregate_std": float(rewards.std(unbiased=False).item()),
+    }
+    if score_matrix.shape[0] > 1:
+        per_item_std = score_matrix.std(dim=0, unbiased=False)
+        metrics["reward_ensemble/member_score_std_mean"] = float(per_item_std.mean().item())
+        metrics["reward_ensemble/member_score_range_mean"] = float((score_matrix.max(dim=0).values - score_matrix.min(dim=0).values).mean().item())
+    return rewards, metrics
+
+
+def _add_rollout_preferences_to_replay(
+    replay: deque[ReplayPreferenceExample],
+    rollout,
+    rewards: torch.Tensor,
+    *,
+    min_reward_gap: float,
+) -> int:
+    added = 0
+    group_size = int(rollout.group_size)
+    reward_groups = rewards.detach().cpu().view(-1, group_size)
+    for group_idx, group_rewards in enumerate(reward_groups):
+        best_local = int(torch.argmax(group_rewards).item())
+        worst_local = int(torch.argmin(group_rewards).item())
+        reward_gap = float((group_rewards[best_local] - group_rewards[worst_local]).item())
+        if best_local == worst_local or reward_gap < min_reward_gap:
+            continue
+        best = group_idx * group_size + best_local
+        worst = group_idx * group_size + worst_local
+        replay.append(
+            ReplayPreferenceExample(
+                chosen_input_ids=rollout.input_ids[best].detach().cpu(),
+                chosen_attention_mask=rollout.attention_mask[best].detach().cpu(),
+                chosen_completion_mask=rollout.completion_mask[best].detach().cpu(),
+                chosen_ref_logprobs=rollout.ref_logprobs[best].detach().cpu(),
+                rejected_input_ids=rollout.input_ids[worst].detach().cpu(),
+                rejected_attention_mask=rollout.attention_mask[worst].detach().cpu(),
+                rejected_completion_mask=rollout.completion_mask[worst].detach().cpu(),
+                rejected_ref_logprobs=rollout.ref_logprobs[worst].detach().cpu(),
+                reward_margin=reward_gap,
+            )
+        )
+        added += 1
+    return added
+
+
+def _pad_1d_tensors(
+    rows: Sequence[torch.Tensor],
+    *,
+    pad_value: float | int,
+    dtype: torch.dtype,
+    max_len: int | None = None,
+) -> torch.Tensor:
+    if max_len is None:
+        max_len = max(int(x.numel()) for x in rows)
+    out = torch.full((len(rows), max_len), pad_value, dtype=dtype)
+    for i, row in enumerate(rows):
+        n = int(row.numel())
+        out[i, :n] = row.to(dtype=dtype)
+    return out
+
+
+def _masked_sum_per_row(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (values * mask).sum(dim=1)
+
+
+def _replay_preference_update(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    replay: deque[ReplayPreferenceExample],
+    cfg: OnlineRMGRPOConfig,
+    tokenizer,
+    device: torch.device,
+    rng: random.Random,
+) -> Dict[str, float]:
+    if not cfg.replay_enabled or len(replay) == 0 or cfg.replay_updates_per_step <= 0:
+        return {}
+    model.train()
+    total_loss = 0.0
+    total_margin = 0.0
+    total_reward_margin = 0.0
+    n_updates = 0
+    batch_size = min(cfg.replay_batch_size, len(replay))
+    pad_id = int(tokenizer.pad_token_id)
+
+    for _ in range(cfg.replay_updates_per_step):
+        examples = rng.sample(list(replay), batch_size)
+        seq_max_len = max(
+            max(int(ex.chosen_input_ids.numel()), int(ex.rejected_input_ids.numel()))
+            for ex in examples
+        )
+        logprob_max_len = seq_max_len - 1
+        chosen_input_ids = _pad_1d_tensors([ex.chosen_input_ids for ex in examples], pad_value=pad_id, dtype=torch.long, max_len=seq_max_len).to(device)
+        rejected_input_ids = _pad_1d_tensors([ex.rejected_input_ids for ex in examples], pad_value=pad_id, dtype=torch.long, max_len=seq_max_len).to(device)
+        chosen_attention_mask = _pad_1d_tensors([ex.chosen_attention_mask for ex in examples], pad_value=0, dtype=torch.long, max_len=seq_max_len).to(device)
+        rejected_attention_mask = _pad_1d_tensors([ex.rejected_attention_mask for ex in examples], pad_value=0, dtype=torch.long, max_len=seq_max_len).to(device)
+        chosen_completion_mask = _pad_1d_tensors([ex.chosen_completion_mask for ex in examples], pad_value=0.0, dtype=torch.float32, max_len=logprob_max_len).to(device)
+        rejected_completion_mask = _pad_1d_tensors([ex.rejected_completion_mask for ex in examples], pad_value=0.0, dtype=torch.float32, max_len=logprob_max_len).to(device)
+        chosen_ref_logprobs = _pad_1d_tensors([ex.chosen_ref_logprobs for ex in examples], pad_value=0.0, dtype=torch.float32, max_len=logprob_max_len).to(device)
+        rejected_ref_logprobs = _pad_1d_tensors([ex.rejected_ref_logprobs for ex in examples], pad_value=0.0, dtype=torch.float32, max_len=logprob_max_len).to(device)
+
+        input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
+        attention_mask = torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
+        completion_mask = torch.cat([chosen_completion_mask, rejected_completion_mask], dim=0)
+        policy_logprobs = compute_per_token_logprobs(model, input_ids, attention_mask, enable_grad=True)
+        chosen_policy, rejected_policy = _masked_sum_per_row(policy_logprobs, completion_mask).chunk(2, dim=0)
+        chosen_ref = _masked_sum_per_row(chosen_ref_logprobs, chosen_completion_mask)
+        rejected_ref = _masked_sum_per_row(rejected_ref_logprobs, rejected_completion_mask)
+        logits = cfg.replay_beta * ((chosen_policy - rejected_policy) - (chosen_ref - rejected_ref))
+
+        if cfg.replay_algo == "dpo":
+            loss = -F.logsigmoid(logits).mean()
+        elif cfg.replay_algo == "ipo":
+            loss = ((logits - (1.0 / (2.0 * cfg.replay_beta))) ** 2).mean()
+        else:
+            raise ValueError(f"Unsupported replay_algo={cfg.replay_algo}")
+
+        weighted_loss = cfg.replay_loss_weight * loss
+        weighted_loss.backward()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm).item())
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        total_loss += float(loss.detach().item())
+        total_margin += float(logits.detach().mean().item())
+        total_reward_margin += float(sum(ex.reward_margin for ex in examples) / max(1, len(examples)))
+        n_updates += 1
+
+    n = max(1, n_updates)
+    return {
+        "replay/loss": total_loss / n,
+        "replay/reference_corrected_margin": total_margin / n,
+        "replay/reward_margin": total_reward_margin / n,
+        "replay/buffer_size": float(len(replay)),
+        "replay/updates": float(n_updates),
+        "replay/grad_norm": grad_norm if n_updates else 0.0,
+    }
 
 def _build_online_algo(cfg: OnlineRMGRPOConfig):
     algo_cfg = AlgoConfig(
@@ -296,6 +635,10 @@ def save_checkpoint(model: torch.nn.Module, cfg: OnlineRMGRPOConfig, step: int) 
         "model_name": cfg.model_name,
         "reward_model_name": cfg.reward_model_name,
         "reward_adapter_path": cfg.reward_adapter_path,
+        "reward_adapter_paths": cfg.reward_adapter_paths or [cfg.reward_adapter_path],
+        "reward_aggregation": cfg.reward_aggregation,
+        "advantage_mode": cfg.advantage_mode,
+        "replay_enabled": cfg.replay_enabled,
         "dataset_name": cfg.dataset_name,
         "train_split": cfg.train_split,
         "eval_split": cfg.eval_split,
@@ -308,8 +651,8 @@ def evaluate_policy_with_reward_model(
     *,
     policy_model: torch.nn.Module,
     policy_tokenizer,
-    reward_model: torch.nn.Module,
-    reward_tokenizer,
+    reward_handles: Sequence[RewardModelHandle],
+    cfg: OnlineRMGRPOConfig,
     examples: Sequence[GenerationExample],
     device: torch.device,
     max_prompt_tokens: int,
@@ -354,34 +697,27 @@ def evaluate_policy_with_reward_model(
             )
         else:
             has_reference = False
-    rm_scores = score_prompt_response_pairs(
-        reward_model,
-        reward_tokenizer,
+    score_tensor, reward_metrics = _score_rows_with_reward_models(
+        reward_handles,
         scoring_rows,
-        max_prompt_tokens=max_prompt_tokens,
-        max_response_tokens=max_response_tokens,
-        per_device_batch_size=generation_batch_size,
+        cfg=cfg,
         device=device,
     )
-    score_tensor = torch.tensor(rm_scores, dtype=torch.float32)
     metrics["eval/rm_score_mean_on_policy_generations"] = float(score_tensor.mean().item())
     metrics["eval/rm_score_std_on_policy_generations"] = float(score_tensor.std(unbiased=False).item())
+    metrics.update({f"eval/{k}": v for k, v in reward_metrics.items()})
     if has_reference and reference_rows:
-        ref_scores = score_prompt_response_pairs(
-            reward_model,
-            reward_tokenizer,
+        ref_tensor, _ = _score_rows_with_reward_models(
+            reward_handles,
             reference_rows,
-            max_prompt_tokens=max_prompt_tokens,
-            max_response_tokens=max_response_tokens,
-            per_device_batch_size=generation_batch_size,
+            cfg=cfg,
             device=device,
         )
-        ref_tensor = torch.tensor(ref_scores, dtype=torch.float32)
         margin = score_tensor - ref_tensor
         metrics["eval/rm_reference_score_mean_on_dataset_reference_responses"] = float(ref_tensor.mean().item())
         metrics["eval/rm_fraction_policy_scores_above_reference"] = float((margin > 0).float().mean().item())
         metrics["eval/rm_margin_policy_minus_reference_mean"] = float(margin.mean().item())
-    return metrics, rows, rm_scores
+    return metrics, rows, [float(x) for x in score_tensor.detach().cpu().tolist()]
 
 
 def main() -> None:
@@ -394,8 +730,11 @@ def main() -> None:
         raise ValueError(f"--batch_size must be >= 1, got {cfg.batch_size}")
     if cfg.group_size <= 0:
         raise ValueError(f"--group_size must be >= 1, got {cfg.group_size}")
-    if not cfg.reward_adapter_path:
-        raise ValueError("--reward_adapter_path is required")
+    reward_adapter_paths = _resolve_reward_adapter_paths(cfg)
+    if cfg.reward_model_select_best and cfg.reward_aggregation != "single":
+        raise ValueError("--reward_model_select_best chooses one adapter, so use --reward_aggregation single.")
+    if cfg.replay_enabled and cfg.replay_beta <= 0.0:
+        raise ValueError(f"--replay_beta must be > 0, got {cfg.replay_beta}")
 
     if cfg.wandb_name == OnlineRMGRPOConfig.wandb_name and cfg.algo != OnlineRMGRPOConfig.algo:
         cfg.wandb_name = f"rm_{cfg.algo}"
@@ -411,9 +750,17 @@ def main() -> None:
 
     rng = random.Random(cfg.seed)
     device, dtype = resolve_device_and_dtype()
+    reward_adapter_paths = _select_reward_adapters(cfg, reward_adapter_paths, device, dtype)
+    cfg.reward_adapter_path = reward_adapter_paths[0]
+    cfg.reward_adapter_paths = reward_adapter_paths
+    (output_dir / "resolved_online_rm_grpo_config.json").write_text(
+        json.dumps(vars(cfg), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     print(
         f"[setup] device={device} dtype={dtype} algo={cfg.algo} "
-        f"policy={cfg.model_name} reward_model={cfg.reward_model_name}"
+        f"policy={cfg.model_name} reward_model={cfg.reward_model_name} "
+        f"reward_adapters={len(reward_adapter_paths)} reward_aggregation={cfg.reward_aggregation}"
     )
     print("[setup][hardware]", json.dumps(get_hardware_metrics(device), indent=2, sort_keys=True))
 
@@ -439,17 +786,10 @@ def main() -> None:
     policy_model = loaded_policy.model
     policy_tokenizer = loaded_policy.tokenizer
 
-    loaded_reward = load_reward_model_and_tokenizer(
-        cfg.reward_model_name,
-        device=device,
-        dtype=dtype,
-        adapter_path=cfg.reward_adapter_path,
-    )
-    reward_model = loaded_reward.model
-    reward_tokenizer = loaded_reward.tokenizer
-    reward_model.eval()
-    for p in reward_model.parameters():
-        p.requires_grad_(False)
+    reward_handles = [
+        _load_reward_handle(adapter_path=path, cfg=cfg, device=device, dtype=dtype)
+        for path in reward_adapter_paths
+    ]
 
     optimizer = torch.optim.AdamW(
         [p for p in policy_model.parameters() if p.requires_grad],
@@ -494,8 +834,8 @@ def main() -> None:
         metrics, rows, rm_scores = evaluate_policy_with_reward_model(
             policy_model=policy_model,
             policy_tokenizer=policy_tokenizer,
-            reward_model=reward_model,
-            reward_tokenizer=reward_tokenizer,
+            reward_handles=reward_handles,
+            cfg=cfg,
             examples=eval_examples,
             device=device,
             max_prompt_tokens=cfg.max_prompt_tokens,
@@ -523,6 +863,7 @@ def main() -> None:
     run_eval(step=0, phase="baseline")
 
     start_time = time.time()
+    replay: deque[ReplayPreferenceExample] = deque(maxlen=max(1, cfg.replay_capacity))
     for step in range(1, cfg.steps + 1):
         maybe_update_warmup_lr(optimizer, cfg.lr, step - 1, cfg.warmup_steps)
         prompt_batch = _sample_prompt_batch(train_examples, cfg.batch_size, rng)
@@ -555,19 +896,16 @@ def main() -> None:
                     "response_text": _normalize_completion_for_reward_scoring(completion_text),
                 }
             )
-        reward_scores = score_prompt_response_pairs(
-            reward_model,
-            reward_tokenizer,
+        rewards, reward_ensemble_metrics = _score_rows_with_reward_models(
+            reward_handles,
             reward_rows,
-            max_prompt_tokens=cfg.max_prompt_tokens,
-            max_response_tokens=cfg.max_response_tokens,
-            per_device_batch_size=cfg.reward_batch_size,
+            cfg=cfg,
             device=device,
         )
-        rewards = torch.tensor(reward_scores, device=device, dtype=torch.float32)
-        advantages = _compute_group_advantages(
+        advantages = _compute_advantages(
             rewards,
             cfg.group_size,
+            advantage_mode=cfg.advantage_mode,
             divide_by_std=_algo_divides_advantages_by_std(cfg.algo),
         )
         batch = RolloutBatch(
@@ -587,6 +925,24 @@ def main() -> None:
             batch,
             grad_accum_steps=cfg.grad_accum_steps,
         )
+        replay_added = 0
+        replay_metrics: Dict[str, float] = {}
+        if cfg.replay_enabled:
+            replay_added = _add_rollout_preferences_to_replay(
+                replay,
+                rollout,
+                rewards,
+                min_reward_gap=cfg.replay_min_reward_gap,
+            )
+            replay_metrics = _replay_preference_update(
+                model=policy_model,
+                optimizer=optimizer,
+                replay=replay,
+                cfg=cfg,
+                tokenizer=policy_tokenizer,
+                device=device,
+                rng=rng,
+            )
         completion_lengths = batch.completion_mask.sum(dim=1).float()
         log_metrics = {
             "rollout/reward_model_score_mean": float(rewards.mean().item()),
@@ -595,12 +951,16 @@ def main() -> None:
             "rollout/reward_model_score_max": float(rewards.max().item()),
             "rollout/advantage_mean": float(advantages.mean().item()),
             "rollout/advantage_std": float(advantages.std(unbiased=False).item()),
+            "rollout/advantage_mode_rank": float(cfg.advantage_mode == "rank"),
             "rollout/completion_mean_tokens": float(completion_lengths.mean().item()),
             "rollout/completion_max_tokens": float(completion_lengths.max().item()),
             "rollout/count_completions": float(rewards.numel()),
+            "replay/added_pairs": float(replay_added),
             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
             "time/seconds_since_start": float(time.time() - start_time),
             **train_metrics,
+            **reward_ensemble_metrics,
+            **replay_metrics,
             **get_cuda_memory_metrics(prefix="train"),
         }
         logger.log(log_metrics, step=step)

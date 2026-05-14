@@ -221,7 +221,8 @@ def load_inference_model_and_tokenizer(
     )
     _reset_generation_sampling_defaults(base)
     if adapter_path is not None:
-        model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False)
+        adapter_path = resolve_adapter_path(adapter_path)
+        model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False, local_files_only=True)
     else:
         model = base
     _reset_generation_sampling_defaults(model)
@@ -316,7 +317,8 @@ def load_reward_model_and_tokenizer(
     if getattr(base.config, "pad_token_id", None) is None:
         base.config.pad_token_id = tokenizer.pad_token_id
     if adapter_path is not None:
-        model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False)
+        adapter_path = resolve_adapter_path(adapter_path)
+        model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False, local_files_only=True)
     else:
         model = base
     model.to(device)

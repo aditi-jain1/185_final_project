@@ -1,5 +1,5 @@
 {
-  "score": 1.0,
+  "score": 0.0,
   "tests": [
     {
       "max_score": 1.0,
@@ -28,9 +28,9 @@
     {
       "max_score": 1.0,
       "name": "aot",
-      "output": "win_rate=0.7368 threshold=0.6500 usable=57",
-      "score": 1.0,
-      "status": "passed",
+      "output": "Missing policy_generations/aot.jsonl",
+      "score": 0.0,
+      "status": "failed",
       "visibility": "visible"
     },
     {
@@ -60,7 +60,7 @@
     {
       "max_score": 1.0,
       "name": "part2_best",
-      "output": "Missing part2/offline_best.jsonl and part2/online_best.jsonl",
+      "output": "offline=0.7419 (threshold 0.8200, usable=62)",
       "score": 0.0,
       "status": "failed",
       "visibility": "visible"

@@ -1,137 +1,204 @@
 # CS 185/285 LLM RL Default Final Project
+Commands for running our Part 1 and Part 2 experiments are given below.
+9.1 Reward model
+uv run modal run scripts/modal_train.py::reward_model_train_remote -- \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_prefs \
+--eval_split test_prefs \
+--output_dir /vol/runs/wildchat_min4_judged_5k_reward_model_v1 \
+--per_device_train_batch_size 8 \
+--per_device_eval_batch_size 8 \
+--grad_accum_steps 4 \
+--lr 3e-5 \
+--num_train_epochs 3 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_interval 25 \
+--save_interval 50 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_reward_model_v1
 
-[PASS] reward_model: pair_accuracy=0.8242 threshold=0.7400
-[PASS] dpo: win_rate=0.7692 threshold=0.6500 usable=52
-[PASS] ipo: win_rate=0.7455 threshold=0.6000 usable=55
-[FAIL] aot: win_rate=0.5862 threshold=0.6500 usable=58
-[PASS] grpo: win_rate=0.6889 threshold=0.6000 usable=45
-[FAIL] drgrpo: win_rate=0.5833 threshold=0.6000 usable=48
-[PASS] gspo: win_rate=0.6667 threshold=0.6000 usable=54
+9.2 Offline methods
 
-commands for part 2!
-1) DPO with confidence-weighted pairs
+DPO
 uv run modal run scripts/modal_train.py::train_remote -- \
-  --algo dpo \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
-  --train_split train_prefs \
-  --eval_split test_prefs \
-  --generation_split test_gen \
-  --output_dir /vol/runs/wildchat_min4_judged_5k_dpo_beta01_confidence_v2 \
-  --beta 0.1 \
-  --use_confidence_weighting \
-  --confidence_weight_scale 2.0 \
-  --confidence_weight_min 0.05 \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
-  --grad_accum_steps 4 \
-  --lr 5e-5 \
-  --num_train_epochs 3 \
-  --max_prompt_tokens 700 \
-  --max_response_tokens 512 \
-  --generation_eval_limit 32 \
-  --generation_eval_max_new_tokens 256 \
-  --generation_eval_every 100 \
-  --eval_interval 100 \
-  --save_interval 100 \
-  --wandb_enabled \
-  --wandb_project llm-rl-final-project \
-  --wandb_name wildchat_min4_judged_5k_dpo_beta01_confidence_v2
+--algo dpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_prefs \
+--eval_split test_prefs \
+--generation_split test_gen \
+--output_dir /vol/runs/wildchat_min4_judged_5k_dpo_beta01_v1 \
+--beta 0.1 \
+--per_device_train_batch_size 4 \
+--per_device_eval_batch_size 4 \
+--grad_accum_steps 4 \
+--lr 5e-5 \
+--num_train_epochs 3 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--generation_eval_limit 32 \
+--generation_eval_max_new_tokens 256 \
+--generation_eval_every 100 \
+--eval_interval 100 \
+--save_interval 100 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_dpo_beta01_v1
 
-2) Reward-model reranking over a fixed candidate family
-uv run modal run scripts/modal_train.py::rerank_eval_remote -- \
-  --base_model Qwen/Qwen2.5-1.5B-Instruct \
-  --rm_adapter /vol/runs/wildchat_min4_judged_5k_rm_adapter \
-  --policy_adapters \
-    /vol/runs/wildchat_min4_judged_5k_dpo_beta01_v1/adapter \
-    /vol/runs/wildchat_min4_judged_5k_ipo_v1/adapter \
-    /vol/runs/wildchat_min4_judged_5k_reference_free_v1/adapter \
-  --policy_names dpo ipo reference_free \
-  --eval_dataset /vol/synthetic_datasets/wildchat_min4_judged_5k_v1/test_gen \
-  --prompt_col prompt \
-  --n_prompts 200 \
-  --output_json /vol/runs/wildchat_min4_judged_5k_rerank_results.json
-
-uv run modal run scripts/modal_train.py::rerank_eval_remote -- \
-  --base_model Qwen/Qwen2.5-1.5B-Instruct \
-  --rm_adapter /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/step_000445/adapter \
-  --policy_adapters \
-    /vol/runs/wildchat_min4_judged_5k_dpo_beta01_v1/checkpoints/step_000100/adapter \
-    /vol/runs/wildchat_min4_judged_5k_ipo_v1/checkpoints/step_000300/adapter \
-    /vol/runs/wildchat_min4_judged_5k_reference_free_v1/checkpoints/step_000890/adapter \
-  --policy_names dpo ipo reference_free \
-  --eval_dataset /vol/synthetic_datasets/wildchat_min4_judged_5k_v1/test_gen.jsonl \
-  --prompt_col prompt_text \
-  --n_prompts 200 \
-  --output_json /vol/runs/wildchat_min4_judged_5k_rerank_results.json
-
-3) Push–pull objective: apo_zero
+IPO
 uv run modal run scripts/modal_train.py::train_remote -- \
-  --algo apo_zero \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
-  --train_split train_prefs \
-  --eval_split test_prefs \
-  --generation_split test_gen \
-  --output_dir /vol/runs/wildchat_min4_judged_5k_apo_zero_v1 \
-  --beta 0.1 \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
-  --grad_accum_steps 4 \
-  --lr 5e-5 \
-  --num_train_epochs 3 \
-  --max_prompt_tokens 700 \
-  --max_response_tokens 512 \
-  --generation_eval_limit 32 \
-  --generation_eval_max_new_tokens 256 \
-  --generation_eval_every 100 \
-  --eval_interval 100 \
-  --save_interval 100 \
-  --wandb_enabled \
-  --wandb_project llm-rl-final-project \
-  --wandb_name wildchat_min4_judged_5k_apo_zero_v1
+--algo ipo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_prefs \
+--eval_split test_prefs \
+--generation_split test_gen \
+--output_dir /vol/runs/wildchat_min4_judged_5k_ipo_v1 \
+--beta 0.1 \
+--per_device_train_batch_size 4 \
+--per_device_eval_batch_size 4 \
+--grad_accum_steps 4 \
+--lr 5e-5 \
+--num_train_epochs 3 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--generation_eval_limit 32 \
+--generation_eval_max_new_tokens 256 \
+--generation_eval_every 100 \
+--eval_interval 100 \
+--save_interval 100 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_ipo_v1
 
-4) Reference-free max-margin
+AOT
 uv run modal run scripts/modal_train.py::train_remote -- \
-  --algo reference_free \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
-  --train_split train_prefs \
-  --eval_split test_prefs \
-  --generation_split test_gen \
-  --output_dir /vol/runs/wildchat_min4_judged_5k_reference_free_v1 \
-  --beta 0.1 \
-  --reference_free_margin 1.0 \
-  --reference_free_margin_mode sum \
-  --reference_free_loss_type hinge \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
-  --grad_accum_steps 4 \
-  --lr 5e-5 \
-  --num_train_epochs 3 \
-  --max_prompt_tokens 700 \
-  --max_response_tokens 512 \
-  --generation_eval_limit 32 \
-  --generation_eval_max_new_tokens 256 \
-  --generation_eval_every 100 \
-  --eval_interval 100 \
-  --save_interval 100 \
-  --wandb_enabled \
-  --wandb_project llm-rl-final-project \
-  --wandb_name wildchat_min4_judged_5k_reference_free_v1
+--algo aot \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_prefs \
+--eval_split test_prefs \
+--generation_split test_gen \
+--output_dir /vol/runs/wildchat_min4_judged_5k_aot_beta02_v1 \
+--beta 0.2 \
+--per_device_train_batch_size 4 \
+--per_device_eval_batch_size 4 \
+--grad_accum_steps 4 \
+--lr 5e-5 \
+--num_train_epochs 3 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--generation_eval_limit 32 \
+--generation_eval_max_new_tokens 256 \
+--generation_eval_every 50 \
+--eval_interval 50 \
+--save_interval 50 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_aot_beta02_v1
 
+9.3 Online methods
+GRPO
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_path /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/
+step_000445/adapter \
+--output_dir /vol/runs/wildchat_min4_judged_5k_grpo_rm445_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_grpo_rm445_v1
 
+DrGRPO
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo dr_grpo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_path /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/
+step_000445/adapter \
+--output_dir /vol/runs/wildchat_min4_judged_5k_drgrpo_rm445_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_drgrpo_rm445_v1
 
-
-
-
-
-
-
-
-
-
-
+GSPO
+uv run modal run scripts/modal_train.py::rm_grpo_train_remote -- \
+--algo gspo \
+--model_name Qwen/Qwen2.5-1.5B-Instruct \
+--dataset_name /vol/synthetic_datasets/wildchat_min4_judged_5k_v1 \
+--train_split train_gen \
+--eval_split test_gen \
+--reward_model_name Qwen/Qwen2.5-1.5B-Instruct \
+--reward_adapter_path /vol/runs/wildchat_min4_judged_5k_reward_model_v1/checkpoints/
+step_000445/adapter \
+--output_dir /vol/runs/wildchat_min4_judged_5k_gspo_rm445_v1 \
+--steps 25 \
+--batch_size 16 \
+--group_size 4 \
+--min_new_tokens 32 \
+--max_new_tokens 256 \
+--temperature 0.8 \
+--top_p 0.95 \
+--lr 1e-5 \
+--grad_accum_steps 2 \
+--ppo_epochs 2 \
+--minibatch_size 8 \
+--clip_eps 0.2 \
+--kl_coef 0.01 \
+--max_prompt_tokens 700 \
+--max_response_tokens 512 \
+--eval_limit 32 \
+--eval_interval 25 \
+--save_interval 25 \
+--wandb_enabled \
+--wandb_project llm-rl-final-project \
+--wandb_name wildchat_min4_judged_5k_gspo_rm445_v1
 
 
 
